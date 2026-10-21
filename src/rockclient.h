@@ -349,7 +349,7 @@ private:
     bool m_connected = false;
     QString m_linkState = QStringLiteral("offline");
     QString m_statusLine = QStringLiteral("Нет соединения");
-    QString m_host = QStringLiteral("192.168.222.2");
+    QString m_host = QStringLiteral("95.165.30.178");
     int m_port = 7410;
     QString m_token;
     bool m_authenticated = false;

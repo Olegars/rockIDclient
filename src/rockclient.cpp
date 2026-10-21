@@ -435,8 +435,9 @@ void RockClient::loadSettings()
     const QString storedHost = settings.value(QStringLiteral("host"), m_host).toString().trimmed();
     const bool local = storedHost.isEmpty()
         || storedHost == QStringLiteral("127.0.0.1")
+        || storedHost == QStringLiteral("192.168.222.2")
         || storedHost.compare(QStringLiteral("localhost"), Qt::CaseInsensitive) == 0;
-    m_host = local ? QStringLiteral("192.168.222.2") : storedHost;
+    m_host = local ? QStringLiteral("95.165.30.178") : storedHost;
     m_port = settings.value(QStringLiteral("port"), m_port).toInt();
     if (m_port < 1 || m_port > 65535)
         m_port = 7410;
@@ -457,8 +458,9 @@ void RockClient::saveSettings() const
 void RockClient::setEndpoint(const QString &host, int port)
 {
     QString nextHost = host.trimmed();
-    if (nextHost.isEmpty())
-        nextHost = QStringLiteral("192.168.222.2");
+    if (nextHost.isEmpty() || nextHost == QStringLiteral("127.0.0.1")
+        || nextHost.compare(QStringLiteral("localhost"), Qt::CaseInsensitive) == 0)
+        nextHost = QStringLiteral("95.165.30.178");
     if (port < 1 || port > 65535)
         port = 7410;
     const bool changed = nextHost != m_host || port != m_port;

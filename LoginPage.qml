@@ -283,7 +283,7 @@ Item {
                             LineField {
                                 id: hostField
                                 width: parent.width - portField.width - 8
-                                placeholderText: "192.168.222.2"
+                                placeholderText: "95.165.30.178"
                                 text: client.host
                             }
                             LineField {

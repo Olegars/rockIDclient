@@ -681,7 +681,7 @@ Item {
                     id: serverHost
                     Layout.fillWidth: true
                     text: client.host
-                    placeholderText: "192.168.222.2"
+                    placeholderText: "95.165.30.178"
                     color: Theme.text
                     placeholderTextColor: Theme.secondary
                     selectByMouse: true
