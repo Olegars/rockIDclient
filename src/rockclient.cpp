@@ -101,6 +101,7 @@ QString humanize(const QString &code)
         {QStringLiteral("PREMIUM_REQUIRED"), QStringLiteral("Нужна подписка Premium")},
         {QStringLiteral("NOT_SECRET"), QStringLiteral("Это не секретный чат")},
         {QStringLiteral("NOT_A_CHANNEL"), QStringLiteral("Это не канал")},
+        {QStringLiteral("USE_MEDIA_SOCKET"), QStringLiteral("Звук звонка идёт отдельным соединением")},
         {QStringLiteral("NOT_A_FORUM"), QStringLiteral("В этой группе нет тем")},
         {QStringLiteral("FILE_REQUIRED"), QStringLiteral("Нужен файл")},
         {QStringLiteral("FILE_NOT_FOUND"), QStringLiteral("Файл не найден")},
@@ -547,6 +548,14 @@ void RockClient::onConnected()
 void RockClient::onDisconnected()
 {
     m_pingTimer->stop();
+    if (m_callLive || m_callIncoming) {
+        m_callLive = false;
+        m_callIncoming = false;
+        closeCallMedia();
+        emit callChanged();
+    } else {
+        closeCallMedia();
+    }
     if (m_connected) {
         m_connected = false;
         emit connectedChanged();
@@ -794,6 +803,10 @@ void RockClient::handleUpdate(const QString &type, const QJsonObject &data)
         onCallMedia(data);
         return;
     }
+    if (type == QStringLiteral("call.ring") || type == QStringLiteral("call.ended") || type == QStringLiteral("call.update")) {
+        noteRoom(data, type);
+        return;
+    }
     if (type == QStringLiteral("message.edit")) {
         ingest(messageToMap(data));
         return;
@@ -845,11 +858,6 @@ void RockClient::handleUpdate(const QString &type, const QJsonObject &data)
     }
     if (type == QStringLiteral("screenshot") || type == QStringLiteral("story.screenshot")) {
         emit userNotice(QStringLiteral("Собеседник сделал скриншот"));
-        return;
-    }
-    if (type == QStringLiteral("call.update")) {
-        m_call = data.toVariantMap();
-        emit callChanged();
         return;
     }
     if (type == QStringLiteral("dialog.new")) {

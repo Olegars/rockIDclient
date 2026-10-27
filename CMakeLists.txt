@@ -27,6 +27,7 @@ qt_add_executable(rockIDclient
     third_party/miniz.c
     third_party/miniz_tdef.c
     third_party/miniz_tinfl.c
+    rockid.rc
 )
 
 set_source_files_properties(Theme.qml PROPERTIES QT_QML_SINGLETON_TYPE TRUE)

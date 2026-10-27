@@ -2,7 +2,9 @@
 #include "secretbox.h"
 
 #include <QAudioOutput>
+#include <QAudioSink>
 #include <QAudioSource>
+#include <QNetworkProxy>
 #include <QBuffer>
 #include <QDateTime>
 #include <QFile>
@@ -21,9 +23,13 @@
 #include <QSettings>
 #include <QUuid>
 #include <QStandardPaths>
+#include <QTimer>
 #include <QSysInfo>
 #include <QCryptographicHash>
 
+#include <QtEndian>
+
+#include <cmath>
 #include <cstring>
 #include <QUrl>
 #include <QUrlQuery>
@@ -42,6 +48,33 @@ QString localPath(const QString &path)
     if (url.isLocalFile())
         return url.toLocalFile();
     return path;
+}
+
+void appendBe16(QByteArray &out, quint16 value)
+{
+    char bytes[2];
+    qToBigEndian(value, bytes);
+    out.append(bytes, 2);
+}
+
+void appendBe32(QByteArray &out, quint32 value)
+{
+    char bytes[4];
+    qToBigEndian(value, bytes);
+    out.append(bytes, 4);
+}
+
+void appendBe64(QByteArray &out, qint64 value)
+{
+    char bytes[8];
+    qToBigEndian(value, bytes);
+    out.append(bytes, 8);
+}
+
+quint32 readBe32(const QByteArray &bytes, int offset)
+{
+    const uchar *p = reinterpret_cast<const uchar *>(bytes.constData() + offset);
+    return qFromBigEndian<quint32>(p);
 }
 
 QString spoilers(const QString &text)
@@ -115,9 +148,321 @@ void RockClient::publishIdentity()
     call(QStringLiteral("keys.publish"), params, [](const QJsonObject &) {});
 }
 
+bool RockClient::selfInCall(const QVariantMap &call) const
+{
+    const QVariantList peers = call.value(QStringLiteral("peers")).toList();
+    for (const QVariant &item : peers) {
+        if (item.toMap().value(QStringLiteral("user_id")).toLongLong() == m_meId)
+            return true;
+    }
+    return false;
+}
+
+void RockClient::noteRoom(const QJsonObject &data, const QString &kind)
+{
+    const qint64 id = rockJsonInt(data.value(QStringLiteral("id")));
+    const bool active = data.value(QStringLiteral("active")).toBool(true);
+    const int port = data.value(QStringLiteral("media_port")).toInt();
+    if (port > 0)
+        m_mediaPort = port;
+    const qint64 current = m_call.value(QStringLiteral("id")).toLongLong();
+    if (kind == QStringLiteral("call.ended") || !active) {
+        if (current == 0 || current == id) {
+            m_callLive = false;
+            m_callIncoming = false;
+            m_ignoredCall = 0;
+            closeCallMedia();
+            m_call = data.toVariantMap();
+            emit callChanged();
+        }
+        return;
+    }
+    const QVariantMap room = data.toVariantMap();
+    if (selfInCall(room)) {
+        m_call = room;
+        m_callIncoming = false;
+        emit callChanged();
+        return;
+    }
+    if (!m_callLive && id != m_ignoredCall) {
+        const bool wasIncoming = m_callIncoming;
+        m_call = room;
+        m_callIncoming = true;
+        emit callChanged();
+        if (!wasIncoming)
+            emit userNotice(QStringLiteral("Входящий звонок"));
+        ensureCallSpeaker();
+    }
+}
+
+void RockClient::openCallMedia(int port)
+{
+    closeCallMedia();
+    if (port <= 0) {
+        m_jsonAudio = true;
+        m_mediaReady = true;
+        beginCallAudio();
+        return;
+    }
+    if (!m_mediaSocket) {
+        m_mediaSocket = new QTcpSocket(this);
+        m_mediaSocket->setProxy(QNetworkProxy::NoProxy);
+        connect(m_mediaSocket, &QTcpSocket::connected, this, [this] { sendCallHello(); });
+        connect(m_mediaSocket, &QTcpSocket::readyRead, this, [this] { readCallMedia(); });
+        connect(m_mediaSocket, &QTcpSocket::disconnected, this, [this] {
+            m_mediaReady = false;
+            stopCallAudio();
+        });
+        connect(m_mediaSocket, &QTcpSocket::errorOccurred, this, [this](QAbstractSocket::SocketError error) {
+            if (m_mediaClosing || !m_callLive || error == QAbstractSocket::RemoteHostClosedError)
+                return;
+            emit userNotice(QStringLiteral("Нет звука звонка"));
+        });
+    }
+    m_mediaReady = false;
+    m_mediaBuf.clear();
+    m_mediaSocket->connectToHost(m_host, static_cast<quint16>(port));
+}
+
+void RockClient::closeCallMedia()
+{
+    m_mediaReady = false;
+    m_jsonAudio = false;
+    m_jsonWarned = false;
+    stopCallAudio();
+    m_mediaBuf.clear();
+    if (!m_mediaSocket)
+        return;
+    m_mediaClosing = true;
+    if (m_mediaSocket->state() == QAbstractSocket::ConnectedState) {
+        QByteArray bye;
+        bye.append(char(3));
+        appendBe32(bye, 0);
+        m_mediaSocket->write(bye);
+        m_mediaSocket->flush();
+    }
+    m_mediaSocket->abort();
+    m_mediaClosing = false;
+}
+
+void RockClient::sendCallHello()
+{
+    if (!m_mediaSocket || !m_callLive)
+        return;
+    const QByteArray token = m_token.toUtf8();
+    if (token.size() < 1 || token.size() > 128) {
+        emit userNotice(QStringLiteral("Нет сессии для звонка"));
+        return;
+    }
+    const qint64 callId = m_call.value(QStringLiteral("id")).toLongLong();
+    QByteArray frame;
+    frame.append(char(1));
+    appendBe32(frame, static_cast<quint32>(2 + token.size() + 8));
+    appendBe16(frame, static_cast<quint16>(token.size()));
+    frame.append(token);
+    appendBe64(frame, callId);
+    m_mediaSocket->write(frame);
+}
+
+void RockClient::readCallMedia()
+{
+    if (!m_mediaSocket)
+        return;
+    m_mediaBuf.append(m_mediaSocket->readAll());
+    while (m_mediaBuf.size() >= 5) {
+        const quint32 len = readBe32(m_mediaBuf, 1);
+        if (len > 8192) {
+            closeCallMedia();
+            return;
+        }
+        if (m_mediaBuf.size() < 5 + static_cast<int>(len))
+            break;
+        const uchar op = static_cast<uchar>(m_mediaBuf.at(0));
+        const QByteArray payload = m_mediaBuf.mid(5, static_cast<int>(len));
+        m_mediaBuf.remove(0, 5 + static_cast<int>(len));
+        if (op == 1) {
+            m_mediaReady = true;
+            beginCallAudio();
+        } else if (op == 255) {
+            emit userNotice(QStringLiteral("Звонок не принял звук"));
+            closeCallMedia();
+            return;
+        } else if (op == 2 && payload.size() >= 20 && m_callOutput) {
+            const QByteArray pcm = payload.mid(20);
+            const int even = pcm.size() - (pcm.size() % 2);
+            if (even >= 2)
+                m_callOutput->write(pcm.constData(), even);
+        }
+    }
+}
+
+void RockClient::beginCallAudio()
+{
+    if (m_voiceRecording) {
+        if (m_mic)
+            m_mic->stop();
+        if (m_pcm)
+            m_pcm->close();
+        m_voiceRecording = false;
+        m_upRecord = false;
+        emit voiceRecordingChanged();
+    }
+    QAudioFormat format;
+    format.setSampleRate(16000);
+    format.setChannelCount(1);
+    format.setSampleFormat(QAudioFormat::Int16);
+    ensureCallSpeaker();
+    if (!m_callMic)
+        m_callMic = new QAudioSource(format, this);
+    if (!m_callInput) {
+        m_callInput = m_callMic->start();
+        if (!m_callInput)
+            emit userNotice(QStringLiteral("Нет микрофона"));
+    }
+}
+
+void RockClient::stopCallAudio()
+{
+    if (m_callTimer)
+        m_callTimer->stop();
+    if (m_callMic)
+        m_callMic->stop();
+    m_callInput = nullptr;
+    if (m_callSpeaker)
+        m_callSpeaker->stop();
+    m_callOutput = nullptr;
+    m_callPending.clear();
+    m_ringSample = 0;
+}
+
+bool RockClient::callNeedsRing() const
+{
+    if (m_callIncoming)
+        return true;
+    if (!m_callLive)
+        return false;
+    const QVariantList peers = m_call.value(QStringLiteral("peers")).toList();
+    for (const QVariant &item : peers) {
+        const qint64 id = item.toMap().value(QStringLiteral("user_id")).toLongLong();
+        if (id > 0 && id != m_meId)
+            return false;
+    }
+    return true;
+}
+
+void RockClient::ensureCallSpeaker()
+{
+    QAudioFormat format;
+    format.setSampleRate(16000);
+    format.setChannelCount(1);
+    format.setSampleFormat(QAudioFormat::Int16);
+    if (!m_callSpeaker) {
+        m_callSpeaker = new QAudioSink(format, this);
+        m_callSpeaker->setBufferSize(6400);
+        m_callSpeaker->setVolume(1.0);
+    }
+    if (!m_callOutput) {
+        m_callOutput = m_callSpeaker->start();
+        if (!m_callOutput)
+            emit userNotice(QStringLiteral("Нет динамика"));
+    }
+    if (!m_callTimer) {
+        m_callTimer = new QTimer(this);
+        connect(m_callTimer, &QTimer::timeout, this, [this] { pumpCallMic(); });
+    }
+    if (!m_callTimer->isActive())
+        m_callTimer->start(40);
+}
+
+void RockClient::writeCallRing()
+{
+    if (!m_callOutput)
+        return;
+    constexpr int samples = 640;
+    QByteArray pcm(samples * 2, 0);
+    qint16 *out = reinterpret_cast<qint16 *>(pcm.data());
+    const bool incoming = m_callIncoming;
+    for (int i = 0; i < samples; ++i) {
+        const qint64 t = m_ringSample + i;
+        const qint64 cycle = incoming ? 48000 : 80000;
+        const qint64 pos = t % cycle;
+        const bool on = incoming ? (pos < 6400 || (pos >= 9600 && pos < 16000)) : pos < 16000;
+        if (!on)
+            continue;
+        const double wave = std::sin(2.0 * 3.141592653589793 * 425.0 * static_cast<double>(t % 16000) / 16000.0);
+        out[i] = static_cast<qint16>(wave * 14000.0);
+    }
+    m_ringSample += samples;
+    m_callOutput->write(pcm);
+}
+
+void RockClient::pumpCallMic()
+{
+    if (m_callLive && m_mediaReady && m_callInput) {
+        m_callPending.append(m_callInput->readAll());
+        constexpr int kFrame = 1280;
+        while (m_callPending.size() >= kFrame) {
+            const QByteArray frame = m_callPending.left(kFrame);
+            m_callPending.remove(0, kFrame);
+            if (!m_callMuted)
+                sendCallPcm(frame);
+            if (m_callPending.size() > kFrame)
+                m_callPending.remove(0, m_callPending.size() - kFrame);
+        }
+    }
+    if (callNeedsRing())
+        writeCallRing();
+    else if (!m_callLive)
+        stopCallAudio();
+}
+
+void RockClient::sendCallPcm(const QByteArray &pcm)
+{
+    if (!m_mediaReady || pcm.isEmpty() || pcm.size() > 8192)
+        return;
+    if (m_jsonAudio) {
+        const qint64 callId = m_call.value(QStringLiteral("id")).toLongLong();
+        if (callId <= 0)
+            return;
+        QJsonObject params;
+        params.insert(QStringLiteral("call_id"), static_cast<double>(callId));
+        params.insert(QStringLiteral("kind"), QStringLiteral("audio"));
+        params.insert(QStringLiteral("data"), QString::fromLatin1(pcm.toBase64()));
+        call(QStringLiteral("calls.media"), params, [this](const QJsonObject &response) {
+            if (response.value(QStringLiteral("ok")).toBool() || !m_jsonAudio || m_jsonWarned)
+                return;
+            m_jsonWarned = true;
+            const QString code = rockErrorCode(response);
+            if (code == QStringLiteral("USE_MEDIA_SOCKET")) {
+                m_jsonAudio = false;
+                m_mediaReady = false;
+                emit userNotice(QStringLiteral("Сервер ждёт звук на порту 7412, а он закрыт"));
+                return;
+            }
+            emit userNotice(rockHumanize(code));
+        });
+        return;
+    }
+    if (!m_mediaSocket)
+        return;
+    QByteArray frame;
+    frame.append(char(2));
+    appendBe32(frame, static_cast<quint32>(pcm.size()));
+    frame.append(pcm);
+    m_mediaSocket->write(frame);
+}
+
 void RockClient::onCallMedia(const QJsonObject &data)
 {
     const QByteArray raw = QByteArray::fromBase64(data.value(QStringLiteral("data")).toString().toLatin1());
+    if (data.value(QStringLiteral("kind")).toString() == QStringLiteral("audio") && m_callLive && raw.size() >= 2) {
+        if (!m_callOutput)
+            beginCallAudio();
+        const int even = raw.size() - (raw.size() % 2);
+        if (m_callOutput && even >= 2)
+            m_callOutput->write(raw.constData(), even);
+        return;
+    }
     if (data.value(QStringLiteral("kind")).toString() != QStringLiteral("audio") || raw.size() < 32) {
         emit userNotice(QStringLiteral("Фрагмент эфира"));
         return;
@@ -1055,39 +1400,97 @@ void RockClient::setAppIcon(const QString &color)
 
 void RockClient::startCall()
 {
+    if (m_callLive)
+        return;
+    if (m_activeDialogId <= 0) {
+        emit userNotice(QStringLiteral("Откройте чат"));
+        return;
+    }
     callAction(QStringLiteral("start"), m_activeDialogId, false, false, false, false);
+}
+
+void RockClient::acceptCall()
+{
+    const qint64 id = m_call.value(QStringLiteral("id")).toLongLong();
+    if (id <= 0 || m_callLive)
+        return;
+    callAction(QStringLiteral("join"), id, false, false, false, false);
+}
+
+void RockClient::declineCall()
+{
+    m_ignoredCall = m_call.value(QStringLiteral("id")).toLongLong();
+    m_callIncoming = false;
+    stopCallAudio();
+    emit callChanged();
+}
+
+void RockClient::hangUp()
+{
+    const qint64 id = m_call.value(QStringLiteral("id")).toLongLong();
+    callAction(QStringLiteral("leave"), id, false, false, false, false);
+}
+
+void RockClient::toggleCallMute()
+{
+    if (!m_callLive)
+        return;
+    const qint64 id = m_call.value(QStringLiteral("id")).toLongLong();
+    callAction(QStringLiteral("state"), id, !m_callMuted, false, false, false);
 }
 
 void RockClient::callAction(const QString &action, qint64 callId, bool muted, bool video, bool screen, bool recording)
 {
     QString method = QStringLiteral("calls.join");
     QJsonObject params;
+    const bool joined = action == QStringLiteral("start") || action == QStringLiteral("join");
     if (action == QStringLiteral("start")) {
         method = QStringLiteral("calls.start");
         params.insert(QStringLiteral("dialog_id"), static_cast<double>(callId > 0 ? callId : m_activeDialogId));
     } else if (action == QStringLiteral("leave")) {
         method = QStringLiteral("calls.leave");
         params.insert(QStringLiteral("call_id"), static_cast<double>(callId));
+        m_ignoredCall = callId;
+        m_callLive = false;
+        m_callIncoming = false;
+        closeCallMedia();
+        emit callChanged();
     } else if (action == QStringLiteral("state")) {
         method = QStringLiteral("calls.setState");
         params.insert(QStringLiteral("call_id"), static_cast<double>(callId));
         params.insert(QStringLiteral("muted"), muted);
         params.insert(QStringLiteral("video"), video);
         params.insert(QStringLiteral("screen"), screen);
+        m_callMuted = muted;
+        emit callChanged();
     } else if (action == QStringLiteral("record")) {
         method = QStringLiteral("calls.record");
         params.insert(QStringLiteral("call_id"), static_cast<double>(callId));
         params.insert(QStringLiteral("recording"), recording);
-        if (recording) {
-            startVoice();
-            m_upRecord = true;
-            emit userNotice(QStringLiteral("Говорите в микрофон, затем нажмите «Остановить запись»"));
-        }
     } else {
         params.insert(QStringLiteral("call_id"), static_cast<double>(callId));
     }
-    rpcOk(method, params, [this](const QJsonObject &result) {
+    rpcOk(method, params, [this, joined](const QJsonObject &result) {
         m_call = result.toVariantMap();
+        const int port = result.value(QStringLiteral("media_port")).toInt();
+        if (port > 0)
+            m_mediaPort = port;
+        const bool active = result.value(QStringLiteral("active")).toBool();
+        if (joined) {
+            m_callLive = active;
+            m_callIncoming = false;
+            m_ignoredCall = 0;
+            m_callMuted = false;
+            emit callChanged();
+            if (active)
+                openCallMedia(m_mediaPort);
+            return;
+        }
+        if (!active) {
+            m_callLive = false;
+            m_callIncoming = false;
+            closeCallMedia();
+        }
         emit callChanged();
     });
 }

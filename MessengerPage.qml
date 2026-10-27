@@ -306,6 +306,49 @@ Item {
             Layout.fillWidth: true
             Layout.fillHeight: true
 
+            Rectangle {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                z: 3
+                height: client.callIncoming || client.callLive ? 52 : 0
+                visible: client.callIncoming || client.callLive
+                color: client.callLive ? "#1d4e3a" : "#1e4d7b"
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 12
+                    anchors.rightMargin: 8
+                    spacing: 8
+                    Text {
+                        Layout.fillWidth: true
+                        text: client.callIncoming ? "Входящий звонок" : (client.callMuted ? "Звонок · микрофон выключен" : "Звонок")
+                        color: "white"
+                        font.pixelSize: 14
+                        elide: Text.ElideRight
+                    }
+                    Button {
+                        visible: client.callIncoming
+                        text: "Принять"
+                        onClicked: client.acceptCall()
+                    }
+                    Button {
+                        visible: client.callIncoming
+                        text: "Отклонить"
+                        onClicked: client.declineCall()
+                    }
+                    Button {
+                        visible: client.callLive
+                        text: client.callMuted ? "Включить" : "Выключить"
+                        onClicked: client.toggleCallMute()
+                    }
+                    Button {
+                        visible: client.callLive
+                        text: "Завершить"
+                        onClicked: client.hangUp()
+                    }
+                }
+            }
+
             ColumnLayout {
                 anchors.fill: parent
                 spacing: 0
@@ -348,6 +391,12 @@ Item {
                             }
                         }
                         IconButton {
+                            glyph: "\uE717"
+                            tip: "Звонок"
+                            visible: !client.callLive
+                            onClicked: client.startCall()
+                        }
+                        IconButton {
                             glyph: "\uE712"
                             tip: "Действия"
                             onClicked: {
@@ -363,7 +412,7 @@ Item {
                     }
                     MouseArea {
                         anchors.fill: parent
-                        anchors.rightMargin: 48
+                        anchors.rightMargin: 140
                         onClicked: root.toggleInfo()
                     }
                 }

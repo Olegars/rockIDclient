@@ -14,8 +14,10 @@
 #include <functional>
 
 class QAudioOutput;
+class QAudioSink;
 class QAudioSource;
 class QBuffer;
+class QIODevice;
 class QMediaPlayer;
 class QNetworkAccessManager;
 class QTimer;
@@ -63,6 +65,9 @@ class RockClient : public QObject {
     Q_PROPERTY(QVariantList sessions READ sessions NOTIFY sessionsChanged)
     Q_PROPERTY(QVariantList topics READ topics NOTIFY topicsChanged)
     Q_PROPERTY(QVariantMap callInfo READ callInfo NOTIFY callChanged)
+    Q_PROPERTY(bool callLive READ callLive NOTIFY callChanged)
+    Q_PROPERTY(bool callIncoming READ callIncoming NOTIFY callChanged)
+    Q_PROPERTY(bool callMuted READ callMuted NOTIFY callChanged)
     Q_PROPERTY(QString listMode READ listMode WRITE setListMode NOTIFY listModeChanged)
     Q_PROPERTY(bool voiceRecording READ voiceRecording NOTIFY voiceRecordingChanged)
     Q_PROPERTY(QVariantList accounts READ accounts NOTIFY accountsChanged)
@@ -112,6 +117,9 @@ public:
     QVariantList sessions() const { return m_sessions; }
     QVariantList topics() const { return m_topics; }
     QVariantMap callInfo() const { return m_call; }
+    bool callLive() const { return m_callLive; }
+    bool callIncoming() const { return m_callIncoming; }
+    bool callMuted() const { return m_callMuted; }
     QString listMode() const { return m_listMode; }
     bool voiceRecording() const { return m_voiceRecording; }
     QVariantList accounts() const { return m_accounts; }
@@ -194,6 +202,10 @@ public:
     Q_INVOKABLE void savePreferences(const QString &json);
     Q_INVOKABLE void setAppIcon(const QString &color);
     Q_INVOKABLE void startCall();
+    Q_INVOKABLE void acceptCall();
+    Q_INVOKABLE void declineCall();
+    Q_INVOKABLE void hangUp();
+    Q_INVOKABLE void toggleCallMute();
     Q_INVOKABLE void callAction(const QString &action, qint64 callId, bool muted, bool video, bool screen, bool recording);
     Q_INVOKABLE void createBot(const QString &username, const QString &displayName);
     Q_INVOKABLE void botSignIn(const QString &botToken);
@@ -335,6 +347,19 @@ private:
     void armSession();
     void publishIdentity();
     void onCallMedia(const QJsonObject &data);
+    void noteRoom(const QJsonObject &data, const QString &kind);
+    void openCallMedia(int port);
+    void closeCallMedia();
+    void sendCallHello();
+    void readCallMedia();
+    void beginCallAudio();
+    void stopCallAudio();
+    void pumpCallMic();
+    void sendCallPcm(const QByteArray &pcm);
+    void ensureCallSpeaker();
+    void writeCallRing();
+    bool callNeedsRing() const;
+    bool selfInCall(const QVariantMap &call) const;
 
     QTcpSocket *m_socket = nullptr;
     QTimer *m_reconnectTimer = nullptr;
@@ -390,6 +415,24 @@ private:
     QVariantList m_board;
     QVariantList m_accounts;
     QVariantMap m_call;
+    bool m_callLive = false;
+    bool m_callIncoming = false;
+    bool m_callMuted = false;
+    qint64 m_ignoredCall = 0;
+    int m_mediaPort = 0;
+    bool m_mediaReady = false;
+    bool m_mediaClosing = false;
+    bool m_jsonAudio = false;
+    bool m_jsonWarned = false;
+    qint64 m_ringSample = 0;
+    QTcpSocket *m_mediaSocket = nullptr;
+    QByteArray m_mediaBuf;
+    QTimer *m_callTimer = nullptr;
+    QAudioSource *m_callMic = nullptr;
+    QIODevice *m_callInput = nullptr;
+    QAudioSink *m_callSpeaker = nullptr;
+    QIODevice *m_callOutput = nullptr;
+    QByteArray m_callPending;
     QString m_boardTitle;
     QString m_listMode = QStringLiteral("Все");
     bool m_voiceRecording = false;

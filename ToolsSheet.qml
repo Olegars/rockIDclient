@@ -175,5 +175,5 @@ Popup {
         }
     }
 
-    signal replyAsked(qint64 id, string quote)
+    signal replyAsked(double id, string quote)
 }
